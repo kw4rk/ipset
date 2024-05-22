@@ -900,6 +900,15 @@ else
 	AC_SUBST(HAVE_NF_BRIDGE_GET_PYSINDEV_NET, undef)
 fi
 
+AC_MSG_CHECKING([kernel source for rcupdate_wait.h])
+if test -f $ksourcedir/include/linux/rcupdate_wait.h; then
+	AC_MSG_RESULT(yes)
+	AC_SUBST(HAVE_RCUPDATE_WAIT_H, define)
+else
+	AC_MSG_RESULT(no)
+	AC_SUBST(HAVE_RCUPDATE_WAIT_H, undef)
+fi
+
 AC_MSG_CHECKING([kernel source for struct net_generic])
 if test -f $ksourcedir/include/net/netns/generic.h && \
    $GREP -q 'struct net_generic' $ksourcedir/include/net/netns/generic.h; then

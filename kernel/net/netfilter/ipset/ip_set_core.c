@@ -1182,48 +1182,50 @@ ip_set_setname_policy[IPSET_ATTR_CMD_MAX + 1] = {
 				    .len = IPSET_MAXNAMELEN - 1 },
 };
 
-/* Destroying a set is split into two stages when a DESTROY command issued:
- * - Cancel garbage collectors and decrement the module reference counter:
- *	- Cancelling may wait and we are allowed to do it at this stage.
- *	- Module remove is protected by rcu_barrier() which waits for
- *	  the second stage to be finished.
- * - In order to prevent the race between kernel side add/del/test element
- *   operations and destroy, the destroying of the set data areas are
- *   performed via a call_rcu() call.
+/* In order to return quickly when destroying a single set, it is split
+ * into two stages:
+ * - Cancel garbage collector
+ * - Destroy the set itself via call_rcu()
  */
 
-/* Call set variant specific destroy function and reclaim the set data. */
 static void
-ip_set_destroy_set_variant(struct ip_set *set)
+ip_set_destroy_set_rcu(struct rcu_head *head)
 {
-	/* Must call it without holding any lock */
+	struct ip_set *set = container_of(head, struct ip_set, rcu);
+
 	set->variant->destroy(set);
+	module_put(set->type->me);
 	kfree(set);
 }
 
 static void
-ip_set_destroy_set_variant_rcu(struct rcu_head *head)
+_destroy_all_sets(struct ip_set_net *inst)
 {
-	struct ip_set *set = container_of(head, struct ip_set, rcu);
+	struct ip_set *set;
+	ip_set_id_t i;
+	bool need_wait = false;
 
-	ip_set_destroy_set_variant(set);
-}
-
-/* Cancel the garbage collectors and decrement module references */
-static void
-ip_set_destroy_cancel_gc(struct ip_set *set)
-{
-	set->variant->cancel_gc(set);
-	module_put(set->type->me);
-}
-
-/* Use when we may wait for the complete destroy to be finished.
- */
-static void
-ip_set_destroy_set(struct ip_set *set)
-{
-	ip_set_destroy_cancel_gc(set);
-	ip_set_destroy_set_variant(set);
+	/* First cancel gc's: set:list sets are flushed as well */
+	for (i = 0; i < inst->ip_set_max; i++) {
+		set = ip_set(inst, i);
+		if (set) {
+			set->variant->cancel_gc(set);
+			if (set->type->features & IPSET_TYPE_NAME)
+				need_wait = true;
+		}
+	}
+	/* Must wait for flush to be really finished  */
+	if (need_wait)
+		rcu_barrier();
+	for (i = 0; i < inst->ip_set_max; i++) {
+		set = ip_set(inst, i);
+		if (set) {
+			ip_set(inst, i) = NULL;
+			set->variant->destroy(set);
+			module_put(set->type->me);
+			kfree(set);
+		}
+	}
 }
 
 static int
@@ -1244,7 +1246,7 @@ IPSET_CBFN(ip_set_destroy, struct net *net, struct sock *ctnl,
 	/* Commands are serialized and references are
 	 * protected by the ip_set_ref_lock.
 	 * External systems (i.e. xt_set) must call
-	 * ip_set_put|get_nfnl_* functions, that way we
+	 * ip_set_nfnl_get_* functions, that way we
 	 * can safely check references here.
 	 *
 	 * list:set timer can only decrement the reference
@@ -1252,8 +1254,6 @@ IPSET_CBFN(ip_set_destroy, struct net *net, struct sock *ctnl,
 	 * without holding the lock.
 	 */
 	if (!attr[IPSET_ATTR_SETNAME]) {
-		/* Must wait for flush to be really finished in list:set */
-		rcu_barrier();
 		read_lock_bh(&ip_set_ref_lock);
 		for (i = 0; i < inst->ip_set_max; i++) {
 			s = ip_set(inst, i);
@@ -1264,13 +1264,7 @@ IPSET_CBFN(ip_set_destroy, struct net *net, struct sock *ctnl,
 		}
 		inst->is_destroyed = true;
 		read_unlock_bh(&ip_set_ref_lock);
-		for (i = 0; i < inst->ip_set_max; i++) {
-			s = ip_set(inst, i);
-			if (s) {
-				ip_set(inst, i) = NULL;
-				ip_set_destroy_set(s);
-			}
-		}
+		_destroy_all_sets(inst);
 		/* Modified by ip_set_destroy() only, which is serialized */
 		inst->is_destroyed = false;
 	} else {
@@ -1291,13 +1285,13 @@ IPSET_CBFN(ip_set_destroy, struct net *net, struct sock *ctnl,
 		features = s->type->features;
 		ip_set(inst, i) = NULL;
 		read_unlock_bh(&ip_set_ref_lock);
+		/* Must cancel garbage collectors */
+		s->variant->cancel_gc(s);
 		if (features & IPSET_TYPE_NAME) {
 			/* Must wait for flush to be really finished  */
 			rcu_barrier();
 		}
-		/* Must cancel garbage collectors */
-		ip_set_destroy_cancel_gc(s);
-		call_rcu(&s->rcu, ip_set_destroy_set_variant_rcu);
+		call_rcu(&s->rcu, ip_set_destroy_set_rcu);
 	}
 	return 0;
 out:
@@ -1835,6 +1829,7 @@ CALL_AD(struct net *net, struct sock *ctnl, struct sk_buff *skb,
 		errmsg->error = ret;
 		unsafe_memcpy(&errmsg->msg, nlh, nlh->nlmsg_len,
 			      /* Bounds checked by the skb layer. */);
+
 		cmdattr = (void *)&errmsg->msg + min_len;
 
 		ret = NLA_PARSE(cda, IPSET_ATTR_CMD_MAX, cmdattr,
@@ -2497,24 +2492,19 @@ err_alloc:
 }
 
 static void __net_exit
+ip_set_net_pre_exit(struct net *net)
+{
+	struct ip_set_net *inst = ip_set_pernet(net);
+
+	inst->is_deleted = true; /* flag for ip_set_nfnl_put */
+}
+
+static void __net_exit
 ip_set_net_exit(struct net *net)
 {
 	struct ip_set_net *inst = ip_set_pernet(net);
 
-	struct ip_set *set = NULL;
-	ip_set_id_t i;
-
-	inst->is_deleted = true; /* flag for ip_set_nfnl_put */
-
-	nfnl_lock(NFNL_SUBSYS_IPSET);
-	for (i = 0; i < inst->ip_set_max; i++) {
-		set = ip_set(inst, i);
-		if (set) {
-			ip_set(inst, i) = NULL;
-			ip_set_destroy_set(set);
-		}
-	}
-	nfnl_unlock(NFNL_SUBSYS_IPSET);
+	_destroy_all_sets(inst);
 	kvfree(rcu_dereference_protected(inst->ip_set_list, 1));
 #ifndef HAVE_NET_OPS_ID
 	kvfree(inst);
@@ -2523,6 +2513,7 @@ ip_set_net_exit(struct net *net)
 
 static struct pernet_operations ip_set_net_ops = {
 	.init	= ip_set_net_init,
+	.pre_exit = ip_set_net_pre_exit,
 	.exit   = ip_set_net_exit,
 #ifdef HAVE_NET_OPS_ID
 	.id	= &ip_set_net_id,
